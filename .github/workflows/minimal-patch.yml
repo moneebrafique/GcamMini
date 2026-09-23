@@ -1,0 +1,105 @@
+name: Minimal patch test
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag of the GitHub Release with the APK attached (named GoogleCamera.apk in the release)'
+        required: true
+        default: 'v1'
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download apktool (latest release, resolved dynamically)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          API_RESPONSE=$(curl -sSL -H "Authorization: token $GH_TOKEN" \
+            https://api.github.com/repos/iBotPeaches/Apktool/releases/latest)
+          URL=$(echo "$API_RESPONSE" \
+            | grep -io '"browser_download_url": *"[^"]*\.jar"' \
+            | grep -o 'https://[^"]*' \
+            | head -n1)
+          echo "Resolved URL: $URL"
+          if [ -z "$URL" ]; then
+            echo "ERROR: no apktool .jar asset found"
+            exit 1
+          fi
+          curl -sSL -o apktool.jar "$URL"
+
+      - name: Download GoogleCamera.apk from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "GoogleCamera.apk" \
+            --output GoogleCamera.apk
+
+      - name: Report APK size (sanity check on which file we actually got)
+        run: |
+          ls -la GoogleCamera.apk
+          du -h GoogleCamera.apk
+
+      - name: Decompile
+        run: |
+          java -jar apktool.jar d GoogleCamera.apk -o build/decompiled --no-debug-info
+
+      - name: Apply minimal patch
+        run: |
+          python3 patch-scripts/minimal_patch.py build/decompiled
+
+      - name: Rebuild
+        run: |
+          java -jar apktool.jar b build/decompiled -o build/patched-unsigned.apk
+
+      - name: Set up Android SDK (for apksigner only)
+        run: |
+          export ANDROID_HOME="$HOME/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd "$ANDROID_HOME/cmdline-tools"
+          curl -sSL -o cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-14742923_latest.zip
+          unzip -q cmdline-tools.zip
+          mv cmdline-tools latest
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Install build-tools
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "build-tools;35.0.0"
+
+      - name: Generate a self-signed debug key
+        run: |
+          keytool -genkeypair -v \
+            -keystore build/debug.keystore \
+            -alias gcammin \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass gcammin123 -keypass gcammin123 \
+            -dname "CN=gcammin, OU=dev, O=dev, L=dev, S=dev, C=US"
+
+      - name: Sign the APK
+        run: |
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+            --ks build/debug.keystore \
+            --ks-pass pass:gcammin123 \
+            --key-pass pass:gcammin123 \
+            --out build/GCamMin-signed.apk \
+            build/patched-unsigned.apk
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: GCamMin-signed
+          path: build/GCamMin-signed.apk
